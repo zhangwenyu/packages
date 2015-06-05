@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-LOOP_NUM=15    #default=64; >=8,<=128
+LOOP_NUM=32    #default=64; >=8,<=128
 CACHE_SIZE=1k
 SNAP_SIZE=512
 #IMAGE_FILE_NUM=3

@@ -2,7 +2,7 @@
 cwd=`pwd`
 
 apt-get install -y python-dev python-pip python-setuptools git make gcc tgt open-iscsi
-pip install pbr
+pip install pbr=0.11.0
 
 for p in brick virtman volt python-voltclient
 do

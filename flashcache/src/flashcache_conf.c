@@ -91,12 +91,14 @@ static void flashcache_sync_for_remove(struct cache_c *dmc);
 
 extern char *flashcache_sw_version;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
 static int
 flashcache_wait_schedule(void *unused)
 {
 	schedule();
 	return 0;
 }
+#endif
 
 static int 
 flashcache_jobs_init(void)
@@ -302,6 +304,7 @@ flashcache_writeback_md_store(struct cache_c *dmc)
 	header->cache_devsize = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
 	header->disk_devsize = to_sector(dmc->disk_dev->bdev->bd_inode->i_size);
 	header->cache_version = dmc->on_ssd_version;
+	header->write_only_cache = dmc->write_only_cache;
 	
 	DPRINTK("Store metadata to disk: block size(%u), md block size(%u), cache size(%llu)" \
 	        "associativity(%u)",
@@ -554,6 +557,7 @@ flashcache_writeback_create(struct cache_c *dmc, int force)
 	header->cache_devsize = to_sector(dmc->cache_dev->bdev->bd_inode->i_size);
 	header->disk_devsize = to_sector(dmc->disk_dev->bdev->bd_inode->i_size);
 	dmc->on_ssd_version = header->cache_version = FLASHCACHE_VERSION;
+	header->write_only_cache = dmc->write_only_cache;
 	where.sector = 0;
 	where.count = dmc->md_block_size;
 	
@@ -620,11 +624,17 @@ flashcache_writeback_load(struct cache_c *dmc)
 		return 1;
 	}
 	dmc->disk_assoc = header->disk_assoc;
+	dmc->write_only_cache = header->write_only_cache;
+	
 	if (header->cache_version < 3)
 		/* Disk Assoc was introduced in On SSD version 3 */
 		dmc->disk_assoc = 0;
 	if (dmc->disk_assoc != 0)
 		dmc->disk_assoc_shift = ffs(dmc->disk_assoc) - 1;
+
+	if (header->cache_version < 4)
+		/* write_only_cache was introduced in On SSD version 4 */
+		dmc->write_only_cache = 0;
 
 	dmc->on_ssd_version = header->cache_version;
 		
@@ -905,7 +915,7 @@ flashcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "flashcache: Virtual device name lookup failed";
 		goto bad3;
 	}
-	
+
 	r = flashcache_kcached_init(dmc);
 	if (r) {
 		ti->error = "Failed to initialize kcached";
@@ -924,7 +934,7 @@ flashcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		r = -EINVAL;
 		goto bad3;
 	}
-	
+
 	/* 
 	 * XXX - Persistence is totally ignored for write through and write around.
 	 * Maybe this should really be moved to the end of the param list ?
@@ -1003,17 +1013,19 @@ flashcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		dmc->assoc = DEFAULT_CACHE_ASSOC;
 	dmc->assoc_shift = ffs(dmc->assoc) - 1;
 
-	if (argc >= 8) {
+	if (argc >= 9) {
 		if (sscanf(argv[8], "%u", &dmc->disk_assoc) != 1) {
 			ti->error = "flashcache: Invalid disk associativity";
 			r = -EINVAL;
 			goto bad3;
 		}
-		if (!dmc->disk_assoc || (dmc->disk_assoc & (dmc->disk_assoc - 1)) ||
-		    dmc->disk_assoc > FLASHCACHE_MAX_DISK_ASSOC ||
-		    dmc->disk_assoc < FLASHCACHE_MIN_DISK_ASSOC ||
-		    dmc->size < dmc->disk_assoc ||
-		    (dmc->assoc * dmc->block_shift) < dmc->disk_assoc) {
+		/* disk_assoc of 0 is permitted value */
+		if ((dmc->disk_assoc > 0) &&
+		    ((!dmc->disk_assoc || (dmc->disk_assoc & (dmc->disk_assoc - 1)) ||
+		      dmc->disk_assoc > FLASHCACHE_MAX_DISK_ASSOC ||
+		      dmc->disk_assoc < FLASHCACHE_MIN_DISK_ASSOC ||
+		      dmc->size < dmc->disk_assoc ||
+		      (dmc->assoc * dmc->block_shift) < dmc->disk_assoc))) {
 			printk(KERN_ERR "Invalid Disk Assoc assoc %d disk_assoc %d size %ld\n",
 			       dmc->assoc, dmc->disk_assoc, dmc->size);
 			ti->error = "flashcache: Invalid disk associativity";
@@ -1024,9 +1036,32 @@ flashcache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (dmc->disk_assoc != 0)
 		dmc->disk_assoc_shift = ffs(dmc->disk_assoc) - 1;
 
+	if (argc >= 10) {
+		if (sscanf(argv[9], "%u", &dmc->write_only_cache) != 1) {
+			ti->error = "flashcache: Invalid Write Cache setting";
+			r = -EINVAL;
+			goto bad3;
+		}
+		if ((dmc->write_only_cache == 1) &&
+		    (dmc->cache_mode != FLASHCACHE_WRITE_BACK)) {
+			printk(KERN_ERR "Write Cache Setting only valid with WRITE_BACK %d\n",
+			       dmc->write_only_cache);
+			ti->error = "flashcache: Invalid Write Cache Setting";
+			r = -EINVAL;
+			goto bad3;
+		}
+		if (dmc->write_only_cache < 0 || dmc->write_only_cache > 1) {
+			printk(KERN_ERR "Invalid Write Cache Setting %d\n",
+			       dmc->write_only_cache);
+			ti->error = "flashcache: Invalid Write Cache Setting";
+			r = -EINVAL;
+			goto bad3;
+		}
+	}
+
 	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK) {
-		if (argc >= 9) {
-			if (sscanf(argv[9], "%u", &dmc->md_block_size) != 1) {
+		if (argc >= 11) {
+			if (sscanf(argv[10], "%u", &dmc->md_block_size) != 1) {
 				ti->error = "flashcache: Invalid metadata block size";
 				r = -EINVAL;
 				goto bad3;
@@ -1106,12 +1141,22 @@ init:
 		goto bad3;
 	}		
 
+	if (flashcache_kcopy_init(dmc)) {
+		ti->error = "Unable to allocate memory";
+		r = -ENOMEM;
+		flashcache_diskclean_destroy(dmc);
+		vfree((void *)dmc->cache);
+		vfree((void *)dmc->cache_sets);
+		goto bad3;
+	}		
+
 	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK) {
 		order = (dmc->md_blocks - 1) * sizeof(struct cache_md_block_head);
 		dmc->md_blocks_buf = (struct cache_md_block_head *)vmalloc(order);
 		if (!dmc->md_blocks_buf) {
 			ti->error = "Unable to allocate memory";
 			r = -ENOMEM;
+			flashcache_kcopy_destroy(dmc);
 			flashcache_diskclean_destroy(dmc);
 			vfree((void *)dmc->cache);
 			vfree((void *)dmc->cache_sets);
@@ -1160,7 +1205,9 @@ init:
 	dmc->sysctl_fast_remove = 0;
 	dmc->sysctl_cache_all = 1;
 	dmc->sysctl_fallow_clean_speed = FALLOW_CLEAN_SPEED;
-	dmc->sysctl_fallow_delay = FALLOW_DELAY;
+	if (dmc->write_only_cache == 0)
+		/* Don't both fallow cleaning for write only caching */
+		dmc->sysctl_fallow_delay = FALLOW_DELAY;
 	dmc->sysctl_skip_seq_thresh_kb = SKIP_SEQUENTIAL_THRESHOLD;
 	dmc->sysctl_clean_on_read_miss = 0;
 	dmc->sysctl_clean_on_write_miss = 0;
@@ -1177,13 +1224,21 @@ init:
 		seq_io_move_to_lruhead(dmc, &dmc->seq_recent_ios[i]);
 	}
 	dmc->seq_io_tail = &dmc->seq_recent_ios[0];
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
 	(void)wait_on_bit_lock(&flashcache_control->synch_flags, FLASHCACHE_UPDATE_LIST,
 			       flashcache_wait_schedule, TASK_UNINTERRUPTIBLE);
+#else
+	(void)wait_on_bit_lock(&flashcache_control->synch_flags, FLASHCACHE_UPDATE_LIST,
+			       TASK_UNINTERRUPTIBLE);
+#endif
 	dmc->next_cache = cache_list_head;
 	cache_list_head = dmc;
 	clear_bit(FLASHCACHE_UPDATE_LIST, &flashcache_control->synch_flags);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
 	smp_mb__after_clear_bit();
+#else
+	smp_mb__after_atomic();
+#endif
 	wake_up_bit(&flashcache_control->synch_flags, FLASHCACHE_UPDATE_LIST);
 
 	for (i = 0 ; i < dmc->size ; i++) {
@@ -1380,8 +1435,36 @@ flashcache_dtr(struct dm_target *ti)
 		nr_queued += dmc->cache[i].nr_queued;
 	DMINFO("cache queued jobs %d", nr_queued);	
 	flashcache_dtr_stats_print(dmc);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
+	(void)wait_on_bit_lock(&flashcache_control->synch_flags, 
+			       FLASHCACHE_UPDATE_LIST,
+			       flashcache_wait_schedule, 
+			       TASK_UNINTERRUPTIBLE);
+#else
+	(void)wait_on_bit_lock(&flashcache_control->synch_flags, 
+			       FLASHCACHE_UPDATE_LIST,
+			       TASK_UNINTERRUPTIBLE);
+#endif
+	nodepp = &cache_list_head;
+	while (*nodepp != NULL) {
+		if (*nodepp == dmc) {
+			*nodepp = dmc->next_cache;
+			break;
+		}
+		nodepp = &((*nodepp)->next_cache);
+	}
+	clear_bit(FLASHCACHE_UPDATE_LIST, &flashcache_control->synch_flags);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
+	smp_mb__after_clear_bit();
+#else
+	smp_mb__after_atomic();
+#endif
+	wake_up_bit(&flashcache_control->synch_flags, FLASHCACHE_UPDATE_LIST);
+
 	flashcache_hash_destroy(dmc);
 	flashcache_diskclean_destroy(dmc);
+	flashcache_kcopy_destroy(dmc);
 	vfree((void *)dmc->cache);
 	vfree((void *)dmc->cache_sets);
 	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK)
@@ -1392,21 +1475,6 @@ flashcache_dtr(struct dm_target *ti)
 	VERIFY(dmc->num_blacklist_pids == 0);
 	dm_put_device(ti, dmc->disk_dev);
 	dm_put_device(ti, dmc->cache_dev);
-	(void)wait_on_bit_lock(&flashcache_control->synch_flags, 
-			       FLASHCACHE_UPDATE_LIST,
-			       flashcache_wait_schedule, 
-			       TASK_UNINTERRUPTIBLE);
-	nodepp = &cache_list_head;
-	while (*nodepp != NULL) {
-		if (*nodepp == dmc) {
-			*nodepp = dmc->next_cache;
-			break;
-		}
-		nodepp = &((*nodepp)->next_cache);
-	}
-	clear_bit(FLASHCACHE_UPDATE_LIST, &flashcache_control->synch_flags);
-	smp_mb__after_clear_bit();
-	wake_up_bit(&flashcache_control->synch_flags, FLASHCACHE_UPDATE_LIST);
 	kfree(dmc);
 }
 
@@ -1418,7 +1486,6 @@ flashcache_status_info(struct cache_c *dmc, status_type_t type,
 	int sz = 0; /* DMEMIT */
 	struct flashcache_stats *stats = &dmc->flashcache_stats;
 
-	
 	if (stats->reads > 0)
 		read_hit_pct = stats->read_hits * 100 / stats->reads;
 	else
@@ -1526,7 +1593,6 @@ flashcache_status_table(struct cache_c *dmc, status_type_t type,
 	int i;
 	int sz = 0; /* DMEMIT */
 	char *cache_mode;
-	
 
 	if (dmc->size > 0) {
 		dirty_pct = ((u_int64_t)atomic_read(&dmc->nr_dirty) * 100) / dmc->size;
@@ -1535,9 +1601,12 @@ flashcache_status_table(struct cache_c *dmc, status_type_t type,
 		cache_pct = 0;
 		dirty_pct = 0;
 	}
-	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK)
-		cache_mode = "WRITE_BACK";
-	else if (dmc->cache_mode == FLASHCACHE_WRITE_THROUGH)
+	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK) {
+		if (dmc->write_only_cache)
+			cache_mode = "WRITE_CACHE";
+		else
+			cache_mode = "WRITE_BACK";
+	} else if (dmc->cache_mode == FLASHCACHE_WRITE_THROUGH)
 		cache_mode = "WRITE_THROUGH";
 	else
 		cache_mode = "WRITE_AROUND";
@@ -1572,6 +1641,15 @@ flashcache_status_table(struct cache_c *dmc, status_type_t type,
 		if (size_hist[i] > 0)
 			DMEMIT("%d:%llu ", i*512, size_hist[i]);
 	}
+#if 0
+	DMEMIT("\n");
+	DMEMIT("Write Clustering Hist: ");
+	for (i = 0 ; i < FLASHCACHE_WRITE_CLUST_HIST_SIZE ; i++) {
+		if (dmc->write_clust_hist[i] > 0)
+			DMEMIT("%d:%llu ", i, dmc->write_clust_hist[i]);
+	}
+	DMEMIT(">=128:%llu ", dmc->write_clust_hist_ovf);	
+#endif
 }
 
 /*
@@ -1596,7 +1674,7 @@ flashcache_status(struct dm_target *ti, status_type_t type,
 #endif
 {
 	struct cache_c *dmc = (struct cache_c *) ti->private;
-	
+
 	switch (type) {
 	case STATUSTYPE_INFO:
 		flashcache_status_info(dmc, type, result, maxlen);
@@ -1610,6 +1688,22 @@ flashcache_status(struct dm_target *ti, status_type_t type,
 #endif
 }
 
+static int
+flashcache_iterate_devices(struct dm_target *ti,
+			   iterate_devices_callout_fn fn, void *data)
+{
+	struct cache_c *dmc = (struct cache_c *) ti->private;
+	
+        int ret = 0;
+
+	ret = fn(ti, dmc->cache_dev, 
+		 0, to_sector(dmc->cache_dev->bdev->bd_inode->i_size),
+		 data);
+	if (!ret)
+		ret = fn(ti, dmc->disk_dev, 0, ti->len, data);		
+        return ret;
+}
+
 static struct target_type flashcache_target = {
 	.name   = "flashcache",
 	.version= {1, 0, 4},
@@ -1619,6 +1713,7 @@ static struct target_type flashcache_target = {
 	.map    = flashcache_map,
 	.status = flashcache_status,
 	.ioctl 	= flashcache_ioctl,
+	.iterate_devices = flashcache_iterate_devices,
 };
 
 static void
@@ -1662,10 +1757,16 @@ flashcache_notify_reboot(struct notifier_block *this,
 {
 	struct cache_c *dmc;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
 	(void)wait_on_bit_lock(&flashcache_control->synch_flags, 
 			       FLASHCACHE_UPDATE_LIST,
 			       flashcache_wait_schedule, 
 			       TASK_UNINTERRUPTIBLE);
+#else
+	(void)wait_on_bit_lock(&flashcache_control->synch_flags, 
+			       FLASHCACHE_UPDATE_LIST,
+			       TASK_UNINTERRUPTIBLE);
+#endif
 	for (dmc = cache_list_head ; 
 	     dmc != NULL ; 
 	     dmc = dmc->next_cache) {
@@ -1677,7 +1778,11 @@ flashcache_notify_reboot(struct notifier_block *this,
 		}
 	}
 	clear_bit(FLASHCACHE_UPDATE_LIST, &flashcache_control->synch_flags);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
 	smp_mb__after_clear_bit();
+#else
+	smp_mb__after_atomic();
+#endif
 	wake_up_bit(&flashcache_control->synch_flags, FLASHCACHE_UPDATE_LIST);
 	return NOTIFY_DONE;
 }
@@ -1792,7 +1897,7 @@ flashcache_init(void)
 /*
  * Destroy a cache target.
  */
-void 
+void __exit
 flashcache_exit(void)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
@@ -1815,7 +1920,7 @@ flashcache_exit(void)
 #endif
 	unregister_reboot_notifier(&flashcache_notifier);
 	flashcache_jobs_exit();
-	flashcache_module_procfs_releae();
+	flashcache_module_procfs_release();
 	kfree(flashcache_control);
 }
 

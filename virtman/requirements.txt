@@ -1,4 +1,4 @@
-pbr>=0.8.0,<1.0
+pbr>=0.8.0
 babel>=1.0
 eventlet>=0.13.0
 pastedeploy>=1.5.0
